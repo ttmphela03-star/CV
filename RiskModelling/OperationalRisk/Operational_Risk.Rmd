@@ -1,0 +1,1633 @@
+---
+title: "Operational_Risk_Capstone"
+output: html_document
+date: "2026-07-11"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Packages
+
+```{r}
+library(readxl)
+library(tidyverse)
+library(evd)
+library(VGAM)
+library(actuar)
+library(tidyverse)
+```
+
+```{r}
+set.seed(2026)
+n <- 1000
+
+# Randomize true parameters (blind yourself)
+p_catastrophic <- runif(1, 0.05, 0.15)
+mu_small <- runif(1, log(30000), log(70000))
+mu_large <- runif(1, log(300000), log(800000))
+
+component <- rbinom(n, 1, p_catastrophic)
+severity <- ifelse(component == 0,
+                    rlnorm(n, mu_small, 0.5),
+                    rlnorm(n, mu_large, 1.0))
+
+# Add noise, rounding, contamination, missingness as above
+severity <- round(severity / 1000) * 1000
+severity <- severity * rnorm(n, 1, 0.05)
+severity[sample(1:n, round(0.02*n))] <- NA
+
+severity.df <- data.frame(
+  claims = severity
+)
+
+write.csv(severity.df, 'Claims.csv', row.names = FALSE)
+
+```
+
+```{r}
+set.seed(2026)
+n_periods <- 250
+
+p_stress      <- runif(1, 0.05, 0.20)
+lambda_calm   <- runif(1, 20, 40)
+lambda_stress <- runif(1, 80, 150)
+size_param    <- runif(1, 10, 30)
+
+regime <- rbinom(n_periods, 1, p_stress)
+N <- ifelse(regime == 0,
+            rnbinom(n_periods, size = size_param, mu = lambda_calm),
+            rnbinom(n_periods, size = size_param, mu = lambda_stress))
+
+crisis_start <- round(n_periods * 0.6)
+crisis_end   <- round(n_periods * 0.75)
+N[crisis_start:crisis_end] <- N[crisis_start:crisis_end] +
+  rpois(length(crisis_start:crisis_end), lambda = 40)
+
+for (t in 2:n_periods) {
+  if (N[t-1] > quantile(N, 0.9, na.rm = TRUE)) {
+    N[t] <- N[t] + rpois(1, lambda = 5)
+  }
+}
+
+reporting_lag_loss <- rbinom(n_periods, size = N, prob = 0.05)
+N_reported <- N - reporting_lag_loss
+
+missing_periods <- sample(1:n_periods, round(0.03 * n_periods))
+N_reported[missing_periods] <- NA
+
+No.claims.df <- data.frame(
+  number_claims = N_reported
+)
+
+write.csv(No.claims.df, 'NoClaims.csv', row.names = FALSE)
+```
+
+### Risk modelling
+
+```{r}
+# Reading in data sets
+claims <- read.csv('Claims.csv')
+
+no.claims <- read.csv('NoClaims.csv')
+
+# Data wrangling 
+print('Summary of Claims Data')
+summary(claims$claims)
+
+print('Summary of Number of Claims Data')
+summary(no.claims$number_claims)
+
+# 
+
+```
+
+### Handling Missing Values
+
+Assumptions:
+
+-   Data is unbiased.
+
+-   No inflationary factors
+
+-   Claims are settled as soon as risk occurs
+
+-   Interest is ignored
+
+-   No other expenses
+
+-   The frequency of claims and severity are assumed to be independent (Assumption should be checked later with tail dependence )
+
+-   Assuming the missing values are random variables and not a known quantity
+
+Method:
+
+Remove missing values from data set. Fit a distribution. Estimate missing values using Monte Carlo simulation. Repeat procedure to obtain a credible interval for missing value estimates then once full analysis is complete. Proceed with sensitivity analysis. Idea was generated using ChatGpt and own initial idea.
+
+Initial idea:Applying a non-parametric confidence interval for the mean claim amounts and number of claims. Use the mean to impute the missing values. Proceed with distribution fitting. Repeat procedure with extremes of bounds and compare results. For further analysis, apply a method similar to Monte Carlo to randomly assign missing values with values from confidence interval to reduce bias.
+
+```{r}
+claims_clean <- as.data.frame(claims[!is.na(claims)])
+
+colnames(claims_clean) <- 'X'
+
+no.claims_clean = as.data.frame(no.claims[!is.na(no.claims)])
+
+colnames(no.claims_clean) <- 'Y'
+
+
+```
+
+### Visual Analysis
+
+```{r}
+options(scipen = 999)
+hist(claims_clean$X,
+     main = 'Density of Claims',
+     xlab = 'Claims',
+     freq = FALSE,
+     xlim = c(0,max(claims_clean$X)))
+
+hist(no.claims_clean$Y,
+     main = 'Density of Number of Claims',
+     xlab = 'Number of Claims',
+     freq = FALSE)
+
+excess_kurtosis = function(x){
+  
+  xbar = mean(x)
+  
+  sdx = sd(x)
+  
+  n = length(x)
+  
+  k = sum(((x-xbar)^4)/(n * sdx^4)) -3
+  
+  res = if(k == 0){
+    'The data is mesokurtic.'
+  } else{
+    if(k > 0){
+      'The data is leptokurtic.'
+    } else{
+      'The data is platykurtic'
+    }
+  }
+  
+  return(c(paste('The excess kurtosis value is:',k),
+           res))
+}
+
+excess_kurtosis(claims_clean$X)
+
+excess_kurtosis(no.claims_clean$Y)
+
+paste('The variance of the number of claims data:', var(no.claims_clean$Y))
+paste('The mean value of the number of claims data:', mean(no.claims_clean$Y))
+
+```
+
+### Results From Visual Analysis
+
+The claim amounts distribution is heavy tailed and decays exponentially with claim size. A reasonable distribution to fit would be a gamma, weibull or pareto
+
+The number of claims are heavy tailed. The mean drastically differs from the variance so a poisson distribution would not be a good fit. Either a negative binomial or binomial would be a good fit.
+
+### Fitting Loss distributions
+
+Assumptions:
+
+The data is independent and identically distributed. ( Further analysis should considered if claims/number of claims are dependent -\> time series )
+
+```{r}
+# Defining the distributions from first principles 
+
+rburr <-function(n, a, lambda, g){ (lambda*((1 - runif(n))^(-1/a) - 1))^(1/g) } 
+
+dburr <-function(x, a, lambda, g){ a * g * lambda^(a)*x^(g - 1)/((lambda + x^g)^(a+1)) }
+
+pburr <-function(q, a, lambda, g){ 1 - (lambda/(lambda + q^g))^a
+}
+
+qburr <-function(p, a, lambda, g){ (lambda*((1 - p)^(-1/a) - 1))^(1/g)
+}
+
+# Negative log-likelihood
+
+neg.loglik.par2 = function(params, data.vector){
+  -sum(log(dparetoII(data.vector, scale = params[1], shape = params[2])))
+}
+
+neg.loglik.par3 = function(params, data.vector){
+  -sum(log(dparetoIII(data.vector, location = params[1], scale = params[2], inequality = params[3])))
+}
+
+neg.loglik.gamma = function(params,data.vector){
+  -sum(log(dgamma(data.vector,params[1],params[2])))
+}
+
+neg.loglik.weibull = function(params, data.vector){
+  -sum(log(dweibull(data.vector, params[1],params[2])))
+}
+
+neg.loglik.lognorm = function(params, data.vector){
+  -sum(log(dlnorm(data.vector, meanlog = params[1], sdlog = params[2])))
+}
+
+neg.loglik.burr = function(params, data.vector){
+  -sum(log(dburr(x = data.vector, a = params[1], lambda = params[2], g = params[3])))
+}
+
+# Moments 
+
+m1 = mean(claims_clean$X)
+m2 = mean(claims_clean$X^2)
+m3 = mean(claims_clean$X^3)
+
+lambda.gam = (m1)/(m2 - m1^2)
+
+alpha.gam = lambda.gam * m1
+
+initial_estimate.gam = c(1/m1,1/m2) 
+
+MLE.gam = optim(initial_estimate.gam, neg.loglik.gamma, data.vector = claims_clean$X)
+
+initial_estimate.wei = c(1/m1,1/m2)
+
+MLE.wei = optim(initial_estimate.wei, neg.loglik.weibull, data.vector = claims_clean$X)
+
+initial_estimate.par2 <- c(1/m1, 1/m2)
+
+MLE.par2 = optim(initial_estimate.par2, neg.loglik.par2,data.vector = claims_clean$X)
+
+initial_estimate.par3 = c(1/m1, 1/m2, 1)
+
+MLE.par3 = optim(initial_estimate.par3, neg.loglik.par3, data.vector = claims_clean$X)
+
+initial_estimate.lnorm = c(m1, m2)
+
+MLE.lnorm = optim(initial_estimate.lnorm, neg.loglik.lognorm, data.vector = claims_clean$X)
+
+initial_estimate.burr = c(1/m1,1/m2,1/m3)
+
+MLE.burr = optim(initial_estimate.burr, neg.loglik.burr, data.vector = claims_clean$X,
+                 method = 'L-BFGS-B',
+                 lower = c(1,1,1),
+                 upper = c(1000,100000,1000))
+
+
+hist(claims_clean$X,
+     main = 'Density of Claims Against Fitted Distributions',
+     xlab = 'Claims',
+     freq = FALSE)
+curve(dparetoII(x, scale = MLE.par2$par[1],shape = MLE.par2$par[2]), col = 'blue', lwd = 3, lty = 2, add = TRUE)
+curve(dweibull(x, MLE.wei$par[1], MLE.wei$par[2]), col = 'red', lwd = 3, lty = 4, add = TRUE)
+curve(dgamma(x, MLE.gam$par[1], MLE.gam$par[2]), col = 'darkgreen', lwd = 3, lty = 6, add = TRUE)
+curve(dparetoIII(x,location = MLE.par3$par[1],scale = MLE.par3$par[2],inequality = MLE.par3$par[3]), col = 'purple', lwd = 3, lty = 2, add = TRUE)
+curve(dlnorm(x, MLE.lnorm$par[1], MLE.lnorm$par[2]), col = 'yellow', lwd = 3, lty = 2, add = TRUE)
+curve(dburr(x, a = MLE.burr$par[1], lambda = MLE.burr$par[2], g = MLE.burr$par[3]), lwd = 3, lty = 2, add = TRUE, col = 'black')
+legend(
+  'topright',
+  legend = c('Pareto2', 'Weibull','Gamma','Pareto3','Log-Normal','Burr'),
+  col = c('blue','red','darkgreen','purple','yellow','black'),
+  lwd = 2
+)
+
+
+
+
+
+```
+
+### Extreme Value Theory
+
+Threshold was chosen from histogram of claims data.
+
+```{r}
+
+claims_clean['block'] = (as.vector(as.numeric(rownames(claims_clean)) - 1)) %/% 12 + 1 # Arranging based on months
+claims.maxima = aggregate(X ~ block, claims_clean, max)
+
+extremes = claims_clean %>% 
+  dplyr::filter(X > 200000) %>% 
+  dplyr::mutate(X = X - 200000)
+
+neg.loglik.fre = function(params, data.vector){
+  -sum(log(VGAM::dfrechet(x = data.vector, loc = params[1], scale = params[2], shape = params[3])))
+}
+
+neg.loglik.genpar = function(params, data.vectors){
+  -sum(log(VGAM::dgpd(x = data.vectors, location = params[1], scale = params[2], shape = params[3])))
+}
+
+
+m1 = mean(claims.maxima$X)
+
+m2 = mean(claims.maxima$X^2)
+
+m3 = mean(claims.maxima$X^3)
+
+initial_estimates.A = c(1/m1,1/m2,1/m3)
+
+m1 = mean(extremes$X)
+
+m2 = mean(extremes$X^2)
+
+m3 = mean(extremes$X^3)
+
+initial_estimates.B = c(1/m1,1/m2,1)
+
+MLE.fre = optim(initial_estimates.A, neg.loglik.fre, data.vector = claims.maxima$X)
+
+MLE.genpar = optim(initial_estimates.B, neg.loglik.genpar, data.vectors = extremes$X,
+                   method = 'L-BFGS-B',
+                 lower = c(1,1,1),
+                 upper = c(1000,100000,1000))
+
+
+hist(claims.maxima$X,
+     main = 'Histogram of Claims Maxima Overlaid by Frechet Density',
+     xlab = 'Claims',
+     freq = FALSE)
+curve(VGAM::dfrechet(x, location = MLE.fre$par[1], MLE.fre$par[2], MLE.fre$par[3]), col = 'blue', lwd = 3, lty = 2, add = TRUE)
+
+hist(extremes$X,
+     main = 'Histogram of Claims Above Threshold Overlaid by Generalised Pareto Distribution',
+     xlab = 'Claims',
+     freq = FALSE)
+curve(VGAM::dgpd(x, location = MLE.genpar$par[1], scale = MLE.genpar$par[2], shape = MLE.genpar$par[3]),
+      col = 'green', lty = 2, lwd = 3, add = TRUE)
+```
+
+### Extreme Value QQ-Plots
+
+```{r}
+n = nrow(claims.maxima)
+
+qqplot(VGAM::qfrechet(p = ppoints(n),location = MLE.fre$par[1],scale = MLE.fre$par[2], shape = MLE.fre$par[3]), claims.maxima$X,
+       xlab = 'Theoretical Quantiles',
+       ylab = 'Empirical Quantiles',
+       main = 'QQ-Plot of Frechet Fit')
+abline(0,1)
+
+n = nrow(extremes)
+
+qqplot(VGAM::qgpd(p = ppoints(n), location = MLE.genpar$par[1], scale = MLE.genpar$par[2], shape = MLE.genpar$par[3]), extremes$X,
+       xlab = 'Theoretical Quantiles',
+       ylab = 'Empirical Quantiles',
+       main = 'QQ-Plot of Generalised Pareto Fit')
+abline(0,1)
+
+```
+
+### Analysis of Extreme Value QQ-Plots
+
+Findings:
+
+The Frechet generalised extreme value distribution overestimates the tail of the claims distribution. This is to expected since the distribution does not have an upper-bound. Beneficial if current geopolitical environment and economy is unstable. The overall distribution matches well with the Frechet.
+
+The generalised pareto distribution underestimates the the left tail significantly and overestimates the right tail significantly. The overall fit of the distribution is poor.
+
+### QQ-Plots
+
+```{r}
+n = nrow(claims_clean)
+
+qqplot(qweibull(ppoints(n), MLE.wei$par[1], MLE.wei$par[2]), sort(claims_clean$X),
+       xlab = 'Theoretical',
+       ylab = 'Empirical',
+       main = 'QQ-Plot of Weibull Fit')
+abline(0,1)
+
+qqplot(qgamma(ppoints(n), MLE.gam$par[1], MLE.gam$par[2]), sort(claims_clean$X),
+       xlab = 'Theoretical',
+       ylab = 'Empirical',
+       main = 'QQ-Plot of Gamma Fit')
+abline(0,1)
+
+qqplot(qparetoII(ppoints(n),scale =  MLE.par2$par[1], shape = MLE.par2$par[2]), claims_clean$X,
+       xlab = 'Theoretical',
+       ylab = 'Empirical',
+       main = 'QQ-Plot of Pareto2 Fit')
+abline(0,1)
+
+qqplot(qparetoIII(ppoints(n),location = MLE.par3$par[1], scale = MLE.par3$par[2], inequality = MLE.par3$par[3]), claims_clean$X,
+       xlab = 'Theoretical',
+       ylab = 'Empirical',
+       main = 'QQ-Plot of Pareto3 Fit')
+abline(0,1)
+
+qqplot(qlnorm(ppoints(n), MLE.lnorm$par[1], MLE.lnorm$par[2]), claims_clean$X,
+       xlab = 'Theoretical',
+       ylab = 'Empirical',
+       main = 'QQ-Plot of Log-Normal Fit')
+abline(0,1)
+
+qqplot(qburr(ppoints(n),a = MLE.burr$par[1], lambda = MLE.burr$par[2], g = MLE.burr$par[3]), sort(claims_clean$X),
+       xlab = 'Theoretical',
+       ylab = 'Empirical',
+       main = 'QQ-Plot of Burr Fit')
+abline(0,1)
+```
+
+### Analysis of QQ-Plots
+
+In general all the distributions under fit the tail of the distribution. This is to be expected from a set of claims data. Possible solutions: Mixed distribution or spliced distribution.
+
+Chosen method: Spliced distribution.
+
+Reasoning:
+
+The general distributions do well at explaining the left tail and body of the distribution but all perform poorly at the right tail of the distribution. Underestimating this will have severe consequences. Using a spliced distribution will allow us to use an extreme value distribution to estimating the right tail and avoid underestimating any right tail claims.
+
+Using a mixed distribution would not appropriately capture the underlying fact that claims tend to have heavy tailed distributions and the bulk of claims occur from the left tail and body of distribution.
+
+Possible spliced distributions:
+
+-   Burr & Frechet
+
+-   Lognormal & Frechet
+
+-   Pareto2 & Frechet
+
+-   Pareto3 & Frechet
+
+### Spliced Distributions
+
+#### Burr & Frechet
+
+```{r}
+
+thresh = 200000 
+
+  
+prob.burr_fre = pburr(thresh, 
+                        a = MLE.burr$par[1],
+                        lambda = MLE.burr$par[2],
+                        g = MLE.burr$par[3])
+
+  
+dspliced.burr_fre = function(x){
+  
+  out = numeric(length(x))
+  below = x <= thresh
+  
+  out[below]  = prob.burr_fre * dburr(x[below],
+                                      a = MLE.burr$par[1], 
+                                      lambda = MLE.burr$par[2], 
+                                      g = MLE.burr$par[3])
+  
+  out[!below] = (1 - prob.burr_fre) * dfrechet(x[!below] - thresh, 
+                                                location = MLE.fre$par[1], 
+                                                scale = MLE.fre$par[2], 
+                                                shape = MLE.fre$par[3])
+  
+  return(out)
+}
+
+pspliced.burr_fre = function(q){
+  
+  out = numeric(length(q))
+  below = q<= thresh
+  
+  out[below] = prob.burr_fre * pburr(q[below],
+                                     a = MLE.burr$par[1],
+                                     lambda = MLE.burr$par[2], 
+                                     g = MLE.burr$par[3])
+  
+  out[!below] = prob.burr_fre + (1- prob.burr_fre) * pfrechet(q[!below] - thresh,
+                                                              location = MLE.fre$par[1],
+                                                              scale = MLE.fre$par[2], 
+                                                              shape = MLE.fre$par[3])
+  
+  return(out)
+  
+}
+
+qspliced.burr_fre = function(p){
+  
+  out = numeric(length(p))
+  below = p <= prob.burr_fre
+  
+  out[below] = qburr(p = p[below]/prob.burr_fre,
+                     a = MLE.burr$par[1],
+                     lambda = MLE.burr$par[2], 
+                     g = MLE.burr$par[3])
+  
+  
+  out[!below] = qfrechet(p = (p[!below] - prob.burr_fre)/(1 - prob.burr_fre),
+                         location = MLE.fre$par[1],
+                         scale = MLE.fre$par[2], 
+                         shape = MLE.fre$par[3]) + thresh
+  
+  return(out)
+  
+}
+
+n = nrow(claims_clean)
+
+qqplot(qspliced.burr_fre(ppoints(n)), y = claims_clean$X,xlab = 'Theoretical Quantiles',ylab = 'Empirical Quantiles',
+       main = paste('QQ-Plot of Spliced Burr-Frechet Fit'))
+abline(0,1)
+
+
+# Goodness of fit test 
+
+breaks = hist(claims_clean$X, plot = FALSE)$breaks
+
+obs = hist(claims_clean$X, plot = FALSE)$counts
+
+counts = length(obs)
+
+ex_probs = diff(pspliced.burr_fre(breaks))
+
+ex.obs =  n* ex_probs
+
+Q = sum(((obs - ex.obs)^2)/ex.obs)
+
+df = counts - 6 -1
+
+ifelse(Q > qchisq(0.95, df),paste('Reject Ho, the distribution is not a good fit for threshold', thresh),paste('Do not reject Ho, the distribution is a good fit for threshold', thresh))
+
+paste('The test statistic is:',Q)
+print('/////////////////////////////////')
+
+
+```
+
+#### Log-Normal & Frechet
+
+```{r}
+
+prob.lnor_fre = plnorm(thresh, MLE.lnorm$par[1], MLE.lnorm$par[2])
+
+dspliced.lnor_fre = function(x){
+  
+  out = numeric(length(x))
+  below = x <= thresh
+  
+  out[below]  = prob.lnor_fre * dlnorm(x[below],
+                                       MLE.lnorm$par[1],
+                                       MLE.lnorm$par[2])
+  
+  out[!below] = (1 - prob.lnor_fre) * dfrechet(x[!below] - thresh, 
+                                                location = MLE.fre$par[1], 
+                                                scale = MLE.fre$par[2], 
+                                                shape = MLE.fre$par[3])
+  
+  return(out)
+}
+
+pspliced.lnor_fre = function(q){
+  
+  out = numeric(length(q))
+  below = q<= thresh
+  
+  out[below] = prob.lnor_fre * plnorm(q[below],
+                                      MLE.lnorm$par[1],
+                                      MLE.lnorm$par[2])
+  
+  out[!below] = prob.lnor_fre + (1- prob.lnor_fre) * pfrechet(q[!below] - thresh,
+                                                              location = MLE.fre$par[1],
+                                                              scale = MLE.fre$par[2], 
+                                                              shape = MLE.fre$par[3])
+  
+  return(out)
+  
+}
+
+qspliced.lnor_fre = function(p){
+  
+  out = numeric(length(p))
+  below = p <= prob.lnor_fre
+  
+  out[below] = qlnorm(p = p[below]/prob.lnor_fre,
+                      MLE.lnorm$par[1], 
+                      MLE.lnorm$par[2])
+  
+  
+  out[!below] = qfrechet(p = (p[!below] - prob.lnor_fre)/(1 - prob.lnor_fre),
+                         location = MLE.fre$par[1],
+                         scale = MLE.fre$par[2], 
+                         shape = MLE.fre$par[3]) + thresh
+  
+  return(out)
+  
+}
+
+
+n = nrow(claims_clean)
+
+qqplot(qspliced.lnor_fre(ppoints(n)), y = claims_clean$X,xlab = 'Theoretical Quantiles',ylab = 'Empirical Quantiles', 
+       main = paste('QQ-Plot of Log-Normal Frechet'))
+abline(0,1)
+
+# Goodness of fit test 
+
+breaks = hist(claims_clean$X, plot = FALSE)$breaks
+
+obs = hist(claims_clean$X, plot = FALSE)$counts
+
+ex_probs = diff(pspliced.lnor_fre(breaks))
+
+ex.obs =  n*ex_probs
+
+counts = length(obs)
+
+Q = sum(((obs - ex.obs)^2)/ex.obs)
+
+df = counts - 5 -1
+
+ifelse(Q > qchisq(0.95, df),paste('Reject Ho, the distribution is not a good fit for threshold', thresh),paste('Do not reject Ho, the distribution is a good fit for threshold', thresh))
+
+print(paste('The test statistic is:',Q))
+print('/////////////////////////////////')
+
+```
+
+#### Pareto2 & Frechet
+
+```{r}
+
+
+prob.par2_fre = pparetoII(thresh, scale =  MLE.par2$par[1], shape = MLE.par2$par[2])
+
+dspliced.par2_fre = function(x){
+  
+  out = numeric(length(x))
+  below = x <= thresh
+  
+  out[below]  = prob.par2_fre * dparetoII(x[below],
+                                          scale =  MLE.par2$par[1],
+                                          shape = MLE.par2$par[2])
+  
+  out[!below] = (1 - prob.par2_fre) * dfrechet(x[!below] - thresh, 
+                                                location = MLE.fre$par[1], 
+                                                scale = MLE.fre$par[2], 
+                                                shape = MLE.fre$par[3])
+  
+  return(out)
+}
+
+pspliced.par2_fre = function(q){
+  
+  out = numeric(length(q))
+  below = q<= thresh
+  
+  out[below] = prob.par2_fre * pparetoII(q[below],
+                                         scale =  MLE.par2$par[1],
+                                         shape = MLE.par2$par[2])
+  
+  out[!below] = prob.par2_fre + (1- prob.par2_fre) * pfrechet(q[!below] - thresh,
+                                                              location = MLE.fre$par[1],
+                                                              scale = MLE.fre$par[2], 
+                                                              shape = MLE.fre$par[3])
+  
+  return(out)
+  
+}
+
+qspliced.par2_fre = function(p){
+  
+  out = numeric(length(p))
+  below = p <= prob.par2_fre
+  
+  out[below] = qparetoII(p = p[below]/prob.par2_fre,
+                         scale =  MLE.par2$par[1], 
+                         shape = MLE.par2$par[2])
+  
+  
+  out[!below] = qfrechet(p = (p[!below] - prob.par2_fre)/(1 - prob.par2_fre),
+                         location = MLE.fre$par[1],
+                         scale = MLE.fre$par[2], 
+                         shape = MLE.fre$par[3]) + thresh
+  
+  return(out)
+  
+}
+
+n = nrow(claims_clean)
+
+qqplot(qspliced.par2_fre(ppoints(n)), y = claims_clean$X,xlab = 'Theoretical Quantiles',ylab = 'Empirical Quantiles', 
+       main = paste('QQ-Plot of Pareto2-Frechet'))
+abline(0,1)
+
+# Goodness of fit test 
+
+breaks = hist(claims_clean$X, plot = FALSE)$breaks
+
+obs = hist(claims_clean$X, plot = FALSE)$counts
+
+ex_probs = diff(pspliced.par2_fre(breaks))
+
+ex.obs =  n* ex_probs
+
+Q = sum(((obs - ex.obs)^2)/ex.obs)
+
+df = counts - 5 -1
+
+ifelse(Q > qchisq(0.95, df),paste('Reject Ho, the distribution is not a good fit for threshold', thresh),paste('Do not reject Ho, the distribution is a good fit for threshold', thresh))
+
+print(paste('The test statistic is:',Q))
+print('/////////////////////////////////')
+
+```
+
+#### Pareto3 & Frechet
+
+```{r}
+  
+prob.par3_fre = pparetoIII(thresh, location = MLE.par3$par[1], scale = MLE.par3$par[2], inequality = MLE.par3$par[3])
+
+dspliced.par3_fre = function(x){
+  
+  out = numeric(length(x))
+  below = x <= thresh
+  
+  out[below]  = prob.par3_fre * dparetoIII(x[below], 
+                                            location = MLE.par3$par[1], 
+                                            scale = MLE.par3$par[2], 
+                                            inequality = MLE.par3$par[3])
+  
+  out[!below] = (1 - prob.par3_fre) * dfrechet(x[!below] - thresh, 
+                                                location = MLE.fre$par[1], 
+                                                scale = MLE.fre$par[2], 
+                                                shape = MLE.fre$par[3])
+  
+  return(out)
+}
+
+pspliced.par3_fre = function(q){
+  
+  out = numeric(length(q))
+  below = q<= thresh
+  
+  out[below] = prob.par3_fre * pparetoIII(q[below],
+                                            location = MLE.par3$par[1], 
+                                            scale = MLE.par3$par[2], 
+                                            inequality = MLE.par3$par[3])
+  
+  out[!below] = prob.par3_fre + (1- prob.par3_fre) * pfrechet(q[!below],location = MLE.fre$par[1],scale = MLE.fre$par[2], shape = MLE.fre$par[3])
+  
+  return(out)
+  
+}
+
+qspliced.par3_fre = function(p){
+  
+  out = numeric(length(p))
+  below = p <= prob.par3_fre
+  
+  out[below] = qparetoIII(p = p[below]/prob.par3_fre,
+                                            location = MLE.par3$par[1], 
+                                            scale = MLE.par3$par[2], 
+                                            inequality = MLE.par3$par[3])
+  
+  
+  out[!below] = qfrechet(p = (p[!below] - prob.par3_fre)/(1 - prob.par3_fre),
+                         location = MLE.fre$par[1],
+                         scale = MLE.fre$par[2], 
+                         shape = MLE.fre$par[3])
+  
+  return(out)
+  
+}
+
+n = nrow(claims_clean)
+
+qqplot(qspliced.par3_fre(ppoints(n)), y = claims_clean$X,xlab = 'Theoretical Quantiles',ylab = 'Empirical Quantiles', 
+       main = paste('QQ-Plot of Pareto3-Frechet'))
+abline(0,1)
+
+# Goodness of fit test 
+
+breaks = hist(claims_clean$X, plot = FALSE)$breaks
+
+obs = hist(claims_clean$X, plot = FALSE)$counts
+
+ex_probs = diff(pspliced.par3_fre(breaks))
+
+ex.obs =  n* ex_probs
+
+Q = sum(((obs - ex.obs)^2)/ex.obs)
+
+df = counts - 6 -1
+
+ifelse(Q > qchisq(0.95, df), print(paste('Reject Ho, the distribution is not a good fit for threshold', thresh)),print(paste('Do not reject Ho, the distribution is a good fit for threshold', thresh)))
+
+print(paste('The test statistic is:',Q))
+print('/////////////////////////////////')
+
+```
+
+### Goodness of Fit Analysis 
+
+By the Chi-squared Goodness of Fit test, we see that the distributions that adhere to the data are the logNormal-Frechet and Pareto2-Frechet.
+
+Surprises from results: Generally thought the Burr-Frechet would be great fit due to the flexibility of the Burr distribution.
+
+Note of caution: The MLE estimates produced are local maxima. There are numerous other options available.
+
+### Comparison of Tails
+
+#### Visual Comparison
+
+```{r}
+options(scipen = 999)
+hist(claims_clean$X,
+     freq = FALSE,
+     xlab = 'Claims',
+     main = 'Histogram of Claims Density Overlaid By Fitted Density')
+lines(density(claims_clean$X), col = 'purple', lwd = 3)
+curve(dspliced.burr_fre(x), col = 'darkgreen', lwd = 3, add = TRUE, lty = 2)
+
+hist(claims_clean$X,
+     freq = FALSE,
+     xlab = 'Claims',
+     main = 'Histogram of Claims Density Overlaid By Fitted Density')
+lines(density(claims_clean$X), col = 'purple', lwd = 3)
+curve(dspliced.lnor_fre(x), col = 'blue', lwd = 3, add = TRUE, lty = 2)
+
+hist(claims_clean$X,
+     freq = FALSE,
+     xlab = 'Claims',
+     main = 'Histogram of Claims Density Overlaid By Fitted Density')
+lines(density(claims_clean$X), col = 'purple', lwd = 3)
+curve(dspliced.par2_fre(x), col = 'red', lwd = 3, add = TRUE, lty = 2)
+```
+
+### Analysis of Visually Fitted Distributions
+
+In comparison with the data, all the fitted distributions tend to relatively smooth. The overall fit is good but we see from the density of the data that there are numerous peaks. This is representative of the volatility found within the real world.
+
+In order to make the fitted distribution more realistic, a sporadic volatility adjustment should be added to the fitted distributions.
+
+### Measures of Tail Weight
+
+#### Hazard rate
+
+```{r}
+options(scipen = 999)
+
+xmin = min(claims_clean$X)
+
+xmax = max(claims_clean$X)
+
+xvalues = seq(xmin, xmax, 100000)
+
+claims_ecdf = ecdf(claims_clean$X)
+
+claims.cdf = claims_ecdf(xvalues)
+
+survival = 1 - claims.cdf   
+
+claims.pdf = density(claims_clean$X)
+
+hazard.claims = claims.pdf$y/survival
+
+set.seed(123)
+
+S = 100000
+# Log-Normal
+
+lnor_fre.claims = sort(qspliced.lnor_fre(runif(S,min = 0,max = 1)))
+
+lnor_fre.ecdf = ecdf(lnor_fre.claims)
+
+lnor_fre.cdf = lnor_fre.ecdf(xvalues)
+
+lnor_fre.surv = 1 - lnor_fre.cdf
+
+lnor_fre.pdf = density(lnor_fre.claims, n = length(lnor_fre.cdf), from = xmin, to = xmax)
+
+lnor_fre.haz = lnor_fre.pdf$y/lnor_fre.surv
+length(lnor_fre.pdf$y)
+
+# Pareto2 
+
+par2_fre.claims = sort(qspliced.par2_fre(runif(S,min = 0,max = 1)))
+
+par2_fre.ecdf = ecdf(par2_fre.claims)
+
+par2_fre.cdf = par2_fre.ecdf(xvalues)
+
+par2_fre.surv = 1 - par2_fre.cdf
+
+par2_fre.pdf = density(par2_fre.claims, n = length(par2_fre.cdf), from = xmin, to = xmax)
+
+par2_fre.haz = par2_fre.pdf$y/par2_fre.surv
+length(par2_fre.pdf$y)
+
+
+plot(x = claims.pdf$x, y = hazard.claims, type = 'l', lwd = 2, lty = 2, col = 'black', xlab = 'Claims', ylab = 'Hazard Rate', main = 'Hazard Rate of Data' )
+plot(x = lnor_fre.pdf$x, y = lnor_fre.haz, type = 'l', lwd = 2, lty = 3, col = 'blue', xlab = 'Claims', ylab = 'Hazard Rate' , main = 'Hazard Rate of Fitted LogNormal-Frechet')
+plot(x = par2_fre.pdf$x, y = par2_fre.haz, type = 'l', lwd = 2, lty = 3, col = 'seagreen', xlab = 'Claims', ylab = 'Hazard Rate', main = 'Hazard Rate of Fitted Pareto2-Frechet')
+
+
+```
+
+### Analysis of Hazard Rate
+
+For a small sample size S, the hazard rates of both fitted distributions following a similar pattern with random peaks within the tail of the distribution. For a large sample size S, the hazard rates converge to the true population rates. The significant outcome of th true rates are the random peaks within the tail of the distribution. These peaks are indicative of potentially larger probability of extreme claims occurring.
+
+The fitted distributions have a smaller hazard rate for all values of x in comparison with the data. This shows our fitted distributions have a heavier tail than the data.
+
+#### Mean Residual Life
+
+```{r}
+
+library(ggplot2)
+
+res.lnor_fre = function(q){
+  1 - pspliced.lnor_fre(q)
+}
+
+res.par2_fre = function(q){
+  1 - pspliced.par2_fre(q)
+}
+
+res.claims = function(q){
+  1 - claims_ecdf(q)
+}
+
+mean_res = function(data.vector, cdf_fun){
+  
+  res_life = numeric(length(data.vector))
+  
+  for(i in 1:length(data.vector)){
+    
+    xi = data.vector[i]
+    
+    Fi = integrate(f = cdf_fun, lower = xi, upper = 10000000)
+    
+    res_life[i] = Fi$value/(1 - cdf_fun(xi))
+  }
+  
+  return(res_life)
+}
+
+
+e.res.lnorm_fre = mean_res(claims_clean$X, pspliced.lnor_fre)
+
+e.res.par2_fre = mean_res(claims_clean$X, pspliced.par2_fre)
+
+e.res.claims = mean_res(claims_clean$X, claims_ecdf)
+
+
+df = data.frame(
+  X = claims_clean$X/10000,
+  eX_claims = e.res.claims/100000,
+  eX_lnor = e.res.lnorm_fre/100000,
+  eX_par2 = e.res.par2_fre/100000
+)
+
+## Adjusted the values for interpretability 
+
+df %>% 
+  ggplot(
+    aes(
+      x = X,
+      y = eX_claims
+    )
+  ) +
+  geom_jitter(color = 'skyblue') +
+  theme_minimal() +
+  labs(
+    title = 'Jitter Plot of Remaining Expected Claim Amount From Claims',
+    x = 'Claim',
+    y = 'e(X)'
+  )
+
+df %>% 
+  ggplot(
+    aes(
+      x = X,
+      y = log(eX_claims)
+    )
+  ) +
+  geom_jitter(color = 'skyblue') +
+  theme_minimal() +
+  labs(
+    title = 'Jitter Plot of Log Remaining Expected Claim Amount From Claims',
+    x = 'Claim',
+    y = 'log e(X)'
+  )
+
+df %>% 
+  ggplot(
+    aes(
+      x = X,
+      y = eX_lnor
+    )
+  ) +
+  geom_jitter(color = 'purple') +
+  theme_minimal() +
+  labs(
+    title = 'Jitter Plot of Remaining Expected Claim Amount From LogNormal-Frechet',
+    x = 'Claim',
+    y = 'e(X)'
+  )
+
+df %>% 
+  ggplot(
+    aes(
+      x = X,
+      y = log(eX_lnor)
+    )
+  ) +
+  geom_jitter(color = 'purple') +
+  theme_minimal() +
+  labs(
+    title = 'Jitter Plot of Log Remaining Expected Claim Amount From LogNormal-Freceht',
+    x = 'Claim',
+    y = 'log e(X)'
+  )
+
+df %>% 
+  ggplot(
+    aes(
+      x = X,
+      y = eX_par2
+    )
+  ) +
+  geom_jitter(color = 'seagreen') +
+  theme_minimal() +
+  labs(
+    title = 'Jitter Plot of Remaining Expected Claim From Pareto2-Frechet',
+    x = 'Claim',
+    y = 'e(X)'
+  )
+  
+df %>% 
+  ggplot(
+    aes(
+      x = X,
+      y = log(eX_par2)
+    )
+  ) +
+  geom_jitter(color = 'seagreen') +
+  theme_minimal() +
+  labs(
+    title = 'Jitter Plot of Log Remaining Expected Claim From Pareto2-Frechet',
+    x = 'Claim',
+    y = 'log e(X)'
+  )
+
+
+```
+
+### Analysis of Mean Residual Life
+
+All the remaining expected claims graphs are increasing. This indicates the fitted distribution and the data have heavy tails.
+
+The log expected remaining claim amount show the rate of the remaining expected claim is lower than the rate of the data set. Not only that but the remaining expected claim of the data is on average larger than the fitted distributions.
+
+### Final Choice of Model
+
+Criteria: BIC
+
+```{r}
+loglik.lnorm_fre = function(x){
+  sum(log(dspliced.lnor_fre(x)))
+  
+}
+
+loglike.par2_fre = function(x){
+  sum(log(dspliced.par2_fre(x)))
+}
+
+BIC_lnor_fre = - 2 * loglik.lnorm_fre(claims_clean$X) + 5 * log(nrow(claims_clean))
+
+BIC_par2_fre = -2 * loglike.par2_fre(claims_clean$X) + 5 * log(nrow(claims_clean))
+
+print(paste('The BIC Score for the Log-normal and Frechet Distribution is:',BIC_lnor_fre))
+print(paste('The BIC Score of the Pareto2 and Frechet Distirbution is:', BIC_par2_fre))
+```
+
+### Generating a Random Sample For The Missing Values
+
+A random sample will be generated to replace the missing values. Proceed with the same fitting methodology applied earlier to find the complete fitted distribution of claims.
+
+For later sensitivity analysis we have computed the non-parametric credible interval for the missing values.
+
+```{r}
+
+set.seed(123)
+
+N = 10000
+
+missing_vals = qspliced.lnor_fre(runif(20, 0, 1))
+
+bounds.mv = quantile(replicate(N,
+                   qspliced.lnor_fre(runif(1,0,1))), c(0.025,0.975))
+
+claims_comp = c(claims_clean$X, missing_vals)
+
+claims_final = data.frame(
+  claims = claims_comp
+)
+
+hist(claims_final$claims,
+     main = 'Density of New Claims Data',
+     xlab = 'Claims',
+     freq = FALSE,
+     xlim = c(0,max(claims_final$claims)))
+
+hist(claims_clean$X,
+     main = 'Density of Old Claims Data',
+     xlab = 'Claims',
+     freq = FALSE,
+     xlim = c(0,max(claims_clean$X)))
+
+
+excess_kurtosis(claims_final$claims)
+
+paste('The excess kurtosis for the final claims data is:', excess_kurtosis(claims_final$claims))
+paste('The excess kurtosis value for the original claims data is:', excess_kurtosis(claims_clean$X))
+print('//////////////////////')
+
+paste('The average new claim severity is:', mean(claims_final$claims))
+paste('The average claim severity of the old claims is:', mean(claims_clean$X))
+print('//////////////////////////////')
+
+paste('The standard deviation of the new claims severity is:', sd(claims_final$claims))
+paste('The standard deviation of the old claims severity is:', sd(claims_clean$X))
+print('//////////////////////////////')
+```
+
+### Fitting The Loss Distribution
+
+```{r}
+
+m1 = mean(claims_final$claims)
+
+m2 = mean(claims_final$claims^2)
+
+initial_estimate.lnorm = c(m1, m2)
+
+MLE.lnormal = optim(initial_estimate.lnorm, neg.loglik.lognorm, data.vector = claims_final$claims)
+
+claims_final['block'] = (as.vector(as.numeric(rownames(claims_final)) - 1)) %/% 12 + 1
+
+claims_final.maxima = aggregate(claims ~ block, claims_final, max)
+
+m1 = mean(claims_final.maxima$claims)
+
+m2 = mean(claims_final.maxima$claims^2)
+
+m3 = mean(claims_final.maxima$claims^3)
+
+
+initial_estimate.frechet = c(1/m1,1/m2,1)
+
+MLE.frechet = optim(initial_estimate.frechet,
+                    neg.loglik.fre,
+                    data.vector = claims_final.maxima$claims,
+                    method = 'L-BFGS-B',
+                    lower = c(-1000,0.2,0.1),
+                    upper = c(1000,1000000,100))
+
+qqplot(
+  x = VGAM::qfrechet(ppoints(nrow(claims_final.maxima)),
+                     location = MLE.frechet$par[1],
+                     scale = MLE.frechet$par[2],
+                     shape = MLE.frechet$par[3]),
+  y = claims_final.maxima$claims,
+  xlab = 'Theoretical Quantiles',
+  ylab = 'Empirical Quanitles'
+)
+abline(0,1)
+
+hist(claims.maxima$X,
+     main = 'Density of Fitted Claims Distribution of Extreme Values',
+     xlab = 'Claims',
+     freq = FALSE)
+curve(VGAM::dfrechet(x, 
+                     location = MLE.frechet$par[1],
+                     scale = MLE.frechet$par[2],
+                     shape = MLE.frechet$par[3]), 
+      col = 'blue',
+      lwd = 2,
+      lty =2,
+      add = TRUE)
+
+qqplot(x = qlnorm(ppoints(nrow(claims_final)),
+              meanlog = MLE.lnormal$par[1],
+              sdlog = MLE.lnormal$par[2]),
+       y = claims_final$claims,
+       xlab = 'Theoretical Quantile',
+       ylab = 'Empirical Quantile')
+abline(0,1)
+
+hist(claims_final$claims,
+     main = 'Density of Fitted Claims Distirbution',
+     xlab = 'Claims',
+     freq = FALSE)
+curve(dlnorm(x,
+              meanlog = MLE.lnormal$par[1],
+              sdlog = MLE.lnormal$par[2]),
+      col = 'navy',
+      lwd = 2,
+      lty = 2,
+      add = TRUE)
+
+thresh = 200000 
+
+prob.thresh = plnorm(thresh, MLE.lnormal$par[1], MLE.lnormal$par[2])
+
+
+dspliced.lnorma_frechet = function(x){
+  
+  out = numeric(length(x))
+  below = x <= thresh
+  
+  out[below]  = prob.thresh * dlnorm(x[below],
+                                       MLE.lnormal$par[1],
+                                       MLE.lnormal$par[2])
+  
+  out[!below] = (1 - prob.thresh) * dfrechet(x[!below] - thresh, 
+                                                location = MLE.frechet$par[1], 
+                                                scale = MLE.frechet$par[2], 
+                                                shape = MLE.frechet$par[3])
+  
+  return(out)
+}
+
+pspliced.lnormal_frechet = function(q){
+  
+  out = numeric(length(q))
+  below = q<= thresh
+  
+  out[below] = prob.thresh * plnorm(q[below],
+                                      MLE.lnormal$par[1],
+                                      MLE.lnormal$par[2])
+  
+  out[!below] = prob.thresh + (1- prob.thresh) * pfrechet(q[!below] - thresh,
+                                                              location = MLE.frechet$par[1],
+                                                              scale = MLE.frechet$par[2], 
+                                                              shape = MLE.frechet$par[3])
+  
+  return(out)
+  
+}
+
+qspliced.lnormal_frechet = function(p){
+  
+  out = numeric(length(p))
+  below = p <= prob.thresh
+  
+  out[below] = qlnorm(p = p[below]/prob.thresh,
+                      MLE.lnormal$par[1], 
+                      MLE.lnormal$par[2])
+  
+  
+  out[!below] = qfrechet(p = (p[!below] - prob.thresh)/(1 - prob.thresh),
+                         location = MLE.frechet$par[1],
+                         scale = MLE.frechet$par[2], 
+                         shape = MLE.frechet$par[3]) + thresh
+  
+  return(out)
+  
+}
+
+
+n = nrow(claims_final)
+
+# Goodness of fit test 
+
+breaks = hist(claims_final$claims, plot = FALSE)$breaks
+
+obs = hist(claims_final$claims, plot = FALSE)$counts
+
+ex_probs = diff(pspliced.lnormal_frechet(breaks))
+
+ex.obs =  n* ex_probs
+
+counts = length(obs)
+
+Q = sum(((obs - ex.obs)^2)/ex.obs)
+
+df = counts - 5 -1
+
+ifelse(Q > qchisq(0.95, df), paste('Reject Ho, the distribution is not a good fit for threshold', thresh),paste('Do not reject Ho, the distribution is a good fit for threshold', thresh))
+
+paste('The test statistic is:',Q)
+print('/////////////////////////////////')
+
+
+```
+
+### Volatility Adjustment
+
+#### Relative Volatility Adjustment 
+
+```{r}
+
+volatility = seq(1,1.2, by = 0.02)
+
+for(vol in volatility){
+  
+    thresh = 200000 
+    
+    prob.thresh = plnorm(thresh, MLE.lnormal$par[1], MLE.lnormal$par[2])
+    
+    
+    dspliced.lnorma_frechet = function(x){
+      
+      out = numeric(length(x))
+      below = x <= thresh
+      
+      out[below]  = prob.thresh * dlnorm(x[below],
+                                           MLE.lnormal$par[1],
+                                           MLE.lnormal$par[2])
+      
+      out[!below] = (1 - prob.thresh) * dfrechet(x[!below] - thresh, 
+                                                    location = MLE.frechet$par[1], 
+                                                    scale = MLE.frechet$par[2], 
+                                                    shape = MLE.frechet$par[3]*vol)
+      
+      return(out)
+    }
+    
+    pspliced.lnormal_frechet = function(q){
+      
+      out = numeric(length(q))
+      below = q<= thresh
+      
+      out[below] = prob.thresh * plnorm(q[below],
+                                          MLE.lnormal$par[1],
+                                          MLE.lnormal$par[2])
+      
+      out[!below] = prob.thresh + (1- prob.thresh) * pfrechet(q[!below] - thresh,
+                                                                  location = MLE.frechet$par[1],
+                                                                  scale = MLE.frechet$par[2], 
+                                                                  shape = MLE.frechet$par[3]*vol)
+      
+      return(out)
+      
+    }
+    
+    qspliced.lnormal_frechet = function(p){
+      
+      out = numeric(length(p))
+      below = p <= prob.thresh
+      
+      out[below] = qlnorm(p = p[below]/prob.thresh,
+                          MLE.lnormal$par[1], 
+                          MLE.lnormal$par[2])
+      
+      
+      out[!below] = qfrechet(p = (p[!below] - prob.thresh)/(1 - prob.thresh),
+                             location = MLE.frechet$par[1],
+                             scale = MLE.frechet$par[2], 
+                             shape = MLE.frechet$par[3]*vol) + thresh
+      
+      return(out)
+      
+    }
+    
+    
+    n = nrow(claims_final)
+    
+    # Goodness of fit test 
+    
+    breaks = hist(claims_final$claims, plot = FALSE)$breaks
+    
+    obs = hist(claims_final$claims, plot = FALSE)$counts
+    
+    ex_probs = diff(pspliced.lnormal_frechet(breaks))
+    
+    ex.obs =  n* ex_probs
+    
+    counts = length(obs)
+    
+    Q = sum(((obs - ex.obs)^2)/ex.obs)
+    
+    df = counts - 5 -1
+    
+    print(paste('Results for volatility:',vol))
+    
+    ifelse(Q > qchisq(0.95, df), print(paste('Reject Ho, the distribution is not a good fit for threshold', thresh)),print(paste('Do not reject Ho, the distribution is a good fit for threshold', thresh)))
+    
+    print(paste('The test statistic is:',Q))
+    print('/////////////////////////////////')
+
+}
+abs.vol.bounds = seq(1,1.2, by = 0.02)
+
+
+```
+
+##### Analysis of Relative Volatility Adjustment 
+
+The bounds for which we may adjust the shape parameter to increase the relative volatility of claims for stress testing is [1,1.2]
+
+#### Absolute Volatility Adjustment 
+
+```{r}
+
+volatility = seq(1,2, by = 0.2)
+
+for(vol in volatility){
+  
+    thresh = 200000 
+    
+    prob.thresh = plnorm(thresh, MLE.lnormal$par[1], MLE.lnormal$par[2])
+    
+    
+    dspliced.lnorma_frechet = function(x){
+      
+      out = numeric(length(x))
+      below = x <= thresh
+      
+      out[below]  = prob.thresh * dlnorm(x[below],
+                                           MLE.lnormal$par[1],
+                                           MLE.lnormal$par[2])
+      
+      out[!below] = (1 - prob.thresh) * dfrechet(x[!below] - thresh, 
+                                                    location = MLE.frechet$par[1], 
+                                                    scale = MLE.frechet$par[2]*vol, 
+                                                    shape = MLE.frechet$par[3])
+      
+      return(out)
+    }
+    
+    pspliced.lnormal_frechet = function(q){
+      
+      out = numeric(length(q))
+      below = q<= thresh
+      
+      out[below] = prob.thresh * plnorm(q[below],
+                                          MLE.lnormal$par[1],
+                                          MLE.lnormal$par[2])
+      
+      out[!below] = prob.thresh + (1- prob.thresh) * pfrechet(q[!below] - thresh,
+                                                                  location = MLE.frechet$par[1],
+                                                                  scale = MLE.frechet$par[2]*vol, 
+                                                                  shape = MLE.frechet$par[3])
+      
+      return(out)
+      
+    }
+    
+    qspliced.lnormal_frechet = function(p){
+      
+      out = numeric(length(p))
+      below = p <= prob.thresh
+      
+      out[below] = qlnorm(p = p[below]/prob.thresh,
+                          MLE.lnormal$par[1], 
+                          MLE.lnormal$par[2])
+      
+      
+      out[!below] = qfrechet(p = (p[!below] - prob.thresh)/(1 - prob.thresh),
+                             location = MLE.frechet$par[1],
+                             scale = MLE.frechet$par[2]*vol, 
+                             shape = MLE.frechet$par[3]) + thresh
+      
+      return(out)
+      
+    }
+    
+    
+    n = nrow(claims_final)
+    
+    # Goodness of fit test 
+    
+    breaks = hist(claims_final$claims, plot = FALSE)$breaks
+    
+    obs = hist(claims_final$claims, plot = FALSE)$counts
+    
+    ex_probs = diff(pspliced.lnormal_frechet(breaks))
+    
+    ex.obs =  n* ex_probs
+    
+    counts = length(obs)
+    
+    Q = sum(((obs - ex.obs)^2)/ex.obs)
+    
+    df = counts - 5 -1
+    
+    print(paste('Results for volatility:',vol))
+    
+    ifelse(Q > qchisq(0.95, df), print(paste('Reject Ho, the distribution is not a good fit for threshold', thresh)),print(paste('Do not reject Ho, the distribution is a good fit for threshold', thresh)))
+    
+    print(paste('The test statistic is:',Q))
+    print('/////////////////////////////////')
+
+}
+
+```
+
+##### Analysis of Absolute Volatility Adjustment 
+
+The bounds for which we may adjust the scale parameter for stress testing the claims under absolute volatility is [1,2]
+
+#### Mixture of Absolute & Relative Volatility Adjustment
+
+```{r}
+
+volatility1= seq(1,1.2, by = 0.05)
+
+volatility2 = seq(1,2, by = 0.2)
+
+for(vol1 in volatility1){
+  
+  for(vol2 in volatility2){
+    
+    thresh = 200000 
+      
+      prob.thresh = plnorm(thresh, MLE.lnormal$par[1], MLE.lnormal$par[2])
+      
+      
+      dspliced.lnorma_frechet = function(x){
+        
+        out = numeric(length(x))
+        below = x <= thresh
+        
+        out[below]  = prob.thresh * dlnorm(x[below],
+                                             MLE.lnormal$par[1],
+                                             MLE.lnormal$par[2])
+        
+        out[!below] = (1 - prob.thresh) * dfrechet(x[!below] - thresh, 
+                                                      location = MLE.frechet$par[1], 
+                                                      scale = MLE.frechet$par[2]*vol1, 
+                                                      shape = MLE.frechet$par[3]*vol2)
+        
+        return(out)
+      }
+      
+      pspliced.lnormal_frechet = function(q){
+        
+        out = numeric(length(q))
+        below = q<= thresh
+        
+        out[below] = prob.thresh * plnorm(q[below],
+                                            MLE.lnormal$par[1],
+                                            MLE.lnormal$par[2])
+        
+        out[!below] = prob.thresh + (1- prob.thresh) * pfrechet(q[!below] - thresh,
+                                                                    location = MLE.frechet$par[1],
+                                                                    scale = MLE.frechet$par[2]*vol1, 
+                                                                    shape = MLE.frechet$par[3]*vol2)
+        
+        return(out)
+        
+      }
+      
+      qspliced.lnormal_frechet = function(p){
+        
+        out = numeric(length(p))
+        below = p <= prob.thresh
+        
+        out[below] = qlnorm(p = p[below]/prob.thresh,
+                            MLE.lnormal$par[1], 
+                            MLE.lnormal$par[2])
+        
+        
+        out[!below] = qfrechet(p = (p[!below] - prob.thresh)/(1 - prob.thresh),
+                               location = MLE.frechet$par[1],
+                               scale = MLE.frechet$par[2]*vol1, 
+                               shape = MLE.frechet$par[3]*vol2) + thresh
+        
+        return(out)
+        
+      }
+      
+      
+      n = nrow(claims_final)
+      
+      # Goodness of fit test 
+      
+      breaks = hist(claims_final$claims, plot = FALSE)$breaks
+      
+      obs = hist(claims_final$claims, plot = FALSE)$counts
+      
+      ex_probs = diff(pspliced.lnormal_frechet(breaks))
+      
+      ex.obs =  n* ex_probs
+      
+      counts = length(obs)
+      
+      Q = sum(((obs - ex.obs)^2)/ex.obs)
+      
+      df = counts - 5 -1
+      
+      print(paste('Results for volatility1 and volatility 2 respectively:','vol1:',vol1,'vol2:', vol2))
+      
+      ifelse(Q > qchisq(0.95, df), print(paste('Reject Ho, the distribution is not a good fit for threshold', thresh)),print(paste('Do not reject Ho, the distribution is a good fit for threshold', thresh)))
+      
+      print(paste('The test statistic is:',Q))
+      print('/////////////////////////////////')
+
+  }
+      
+}
+
+```
+
+### Operational Risk
+
+```{r}
+
+```
